@@ -1,0 +1,125 @@
+name: Release Build
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+jobs:
+  release-build:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease
+
+      - name: Get PR commits and classify
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          
+          # 获取所有提交的标题
+          COMMITS=$(gh pr view $PR_NUMBER --json commits --jq '.commits[].messageHeadline')
+          
+          # 初始化分类
+          NEW_FEATURES=""
+          BUG_FIXES=""
+          OPTIMIZATIONS=""
+          
+          # 逐行处理提交信息
+          while IFS= read -r line; do
+            if [[ -z "$line" ]]; then
+              continue
+            fi
+            
+            # 提取短 hash（假设提交信息末尾有 hash）
+            HASH=$(echo "$line" | grep -oE '[a-f0-9]{7}$' || echo "")
+            MSG=$(echo "$line" | sed 's/ *[a-f0-9]\{7\}$//' | xargs)
+            
+            # 根据 emoji 或关键词分类
+            if [[ "$MSG" == ✨* ]] || [[ "$MSG" == "feat"* ]] || [[ "$MSG" == "feature"* ]] || [[ "$MSG" == "新增"* ]]; then
+              NEW_FEATURES="${NEW_FEATURES}- ${MSG} - by @${PR_AUTHOR} (${HASH})\n"
+            elif [[ "$MSG" == 🐛* ]] || [[ "$MSG" == "fix"* ]] || [[ "$MSG" == "修复"* ]]; then
+              BUG_FIXES="${BUG_FIXES}- ${MSG} - by @${PR_AUTHOR} (${HASH})\n"
+            elif [[ "$MSG" == ⚡* ]] || [[ "$MSG" == "perf"* ]] || [[ "$MSG" == "优化"* ]] || [[ "$MSG" == "refactor"* ]]; then
+              OPTIMIZATIONS="${OPTIMIZATIONS}- ${MSG} - by @${PR_AUTHOR} (${HASH})\n"
+            else
+              # 未分类的放到优化里
+              OPTIMIZATIONS="${OPTIMIZATIONS}- ${MSG} - by @${PR_AUTHOR} (${HASH})\n"
+            fi
+          done <<< "$COMMITS"
+          
+          # 如果没有分类到任何内容，添加默认信息
+          if [[ -z "$NEW_FEATURES" && -z "$BUG_FIXES" && -z "$OPTIMIZATIONS" ]]; then
+            OPTIMIZATIONS="- ${PR_TITLE} - by @${PR_AUTHOR}\n"
+          fi
+          
+          # 保存到文件
+          cat > release_notes.md << EOF
+          ## ✨ 新功能
+          
+          ${NEW_FEATURES:-暂无}
+          
+          ## 🐛 修复
+          
+          ${BUG_FIXES:-暂无}
+          
+          ## ⚡ 优化
+          
+          ${OPTIMIZATIONS:-暂无}
+          
+          ---
+          **PR**: [#${PR_NUMBER}](${PR_URL})
+          **作者**: @${PR_AUTHOR}
+          **合并时间**: ${{ github.event.pull_request.merged_at }}
+          EOF
+          
+          # 同时保存到输出
+          echo "notes_ready=true" >> $GITHUB_OUTPUT
+
+      - name: Get version name
+        id: version
+        run: |
+          VERSION=$(date +'%Y%m%d.%H%M%S')
+          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          body_path: release_notes.md
+          files: |
+            app/build/outputs/apk/release/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
